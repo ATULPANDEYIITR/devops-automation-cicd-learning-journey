@@ -58,3 +58,57 @@ To understand how software is efficiently built, tested, deployed, monitored, an
 * [ ] Deployment
 * [ ] DevSecOps
 * [ ] Reliability & Scalability
+
+# Day 01: DevOps Fundamentals
+
+## Objective
+
+Begin building a strong foundation in DevOps by understanding how development, operations, automation, and software delivery work together.
+
+## Topics Covered
+
+* What is DevOps?
+* Development and Operations
+* DevOps Lifecycle
+* Version Control
+* Automation
+* Continuous Integration
+* Continuous Delivery
+* CI/CD Pipeline
+* Infrastructure
+* Monitoring
+* DevOps Culture
+* Basic DevOps Workflow
+
+## Code Implementation
+
+The Python program demonstrates:
+
+* Basic DevOps concepts
+* Development and operations activities
+* The DevOps lifecycle
+* Version control concepts
+* Automation
+* CI/CD concepts
+* Basic infrastructure components
+* System monitoring
+* DevOps principles
+* The software delivery workflow
+
+**External Libraries:** None
+
+## Why This Matters
+
+DevOps brings development and operations practices together to improve software delivery, automation, reliability, collaboration, and continuous improvement.
+
+These fundamentals provide the foundation for learning Git, Linux, CI/CD tools, containers, Docker, Kubernetes, cloud platforms, Infrastructure as Code, monitoring, and DevSecOps.
+
+## Learning Approach
+
+DevOps will be covered gradually, starting with fundamental concepts and progressing toward version control, Linux, CI/CD, containers, cloud, Infrastructure as Code, monitoring, automation, security, and advanced DevOps practices.
+
+## Day 01 Completed
+
+**Focus:** Introduction to DevOps and Software Delivery
+
+**Next:** Continue with the next concepts in DevOps.
