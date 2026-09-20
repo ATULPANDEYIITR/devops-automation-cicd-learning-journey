@@ -1,0 +1,22 @@
+# File: data/example-task-plan.json
+{
+  "name": "daily-linux-health",
+  "description": "Example read-only administration plan.",
+  "tasks": [
+    {
+      "name": "system-health",
+      "operation": "health",
+      "destructive": false
+    },
+    {
+      "name": "filesystem-audit",
+      "operation": "large-files",
+      "destructive": false
+    }
+  ],
+  "execution_policy": {
+    "dry_run": true,
+    "maximum_parallel_tasks": 4,
+    "require_explicit_confirmation_for_destructive_operations": true
+  }
+}
