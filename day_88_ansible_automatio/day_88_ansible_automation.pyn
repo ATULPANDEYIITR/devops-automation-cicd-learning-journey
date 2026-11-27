@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+"""
+Ansible Automation: Variables, Handlers, Templates, and Conditionals.
+
+A self-contained simulation of an Ansible-style configuration-management
+workflow using Python standard-library components.
+
+The implementation demonstrates:
+- Variable definitions and precedence.
+- Host-specific configuration.
+- Conditional task execution.
+- Change detection and idempotency.
+- Handler notification and execution.
+- Template rendering.
+- Task dependencies and execution results.
+- Error handling and execution reporting.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable
+
+
+class TaskStatus(Enum):
+    CHANGED = "changed"
+    OK = "ok"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
+class AutomationError(Exception):
+    """Base exception for automation failures."""
+
+
+class VariableError(AutomationError):
+    """Raised when variable resolution or validation fails."""
+
+
+class TemplateError(AutomationError):
+    """Raised when template rendering fails."""
+
+
+class TaskError(AutomationError):
+    """Raised when task execution fails."""
+
+
+@dataclass
+class Host:
+    name: str
+    groups: set[str] = field(default_factory=set)
+    facts: dict[str, Any] = field(default_factory=dict)
+    state: dict[str, Any] = field(default_factory=dict)
+    failed: bool = False
+
+
+@dataclass
+class TaskResult:
+    task_name: str
+    host_name: str
+    status: TaskStatus
+    message: str
+
+
+@dataclass
+class Handler:
+    name: str
+    action: Callable[[Host, dict[str, Any]], bool]
+    listen: set[str] = field(default_factory=set)
+
+
+@dataclass
+class Task:
+    name: str
+    action: Callable[[Host, dict[str, Any]], bool]
+    condition: Callable[[Host, dict[str, Any]], bool] | None = None
+    notify: list[str] = field(default_factory=list)
+    tags: set[str] = field(default_factory=set)
+
+
+class VariableResolver:
+    """
+    Simplified Ansible-inspired variable resolution.
+
+    Higher-priority sources override lower-priority sources.
+
+    This is an educational subset, not a complete implementation of
+    Ansible's extensive variable-precedence hierarchy.
+    """
+
+    PRECEDENCE = (
+        "defaults",
+        "inventory",
+        "group_vars",
+        "host_vars",
+        "play_vars",
+        "task_vars",
+        "extra_vars",
+    )
+
+    def __init__(self, sources: dict[str, dict[str, Any]]):
+        self.sources = sources
+
+    def resolve(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+
+        for source in self.PRECEDENCE:
+            values = self.sources.get(source, {})
+
+            if not isinstance(values, dict):
+                raise VariableError(
+                    f"Variable source '{source}' must be a dictionary"
+                )
+
+            result.update(values)
+
+        return result
+
+    @staticmethod
+    def require(
+        variables: dict[str, Any],
+        required: tuple[str, ...],
+    ) -> None:
+        missing = [
+            name for name in required
+            if name not in variables or variables[name] is None
+        ]
+
+        if missing:
+            raise VariableError(
+                f"Missing required variables: {', '.join(missing)}"
+            )
+
+
+class TemplateEngine:
+    """
+    Small template renderer supporting {{ variable }} expressions.
+
+    Undefined variables raise errors instead of silently producing
+    potentially incorrect configuration files.
+    """
+
+    PATTERN = re.compile(r"{{\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*}}")
+
+    @staticmethod
+    def render(template: str, variables: dict[str, Any]) -> str:
+
+        def replace(match: re.Match[str]) -> str:
+            expression = match.group(1)
+            value: Any = variables
+
+            for component in expression.split("."):
+                if not isinstance(value, dict) or component not in value:
+                    raise TemplateError(
+                        f"Undefined template variable: {expression}"
+                    )
+                value = value[component]
+
+            if value is None or isinstance(value, (dict, list, tuple, set)):
+                raise TemplateError(
+                    f"Unsupported template value: {expression}"
+                )
+
+            return str(value)
+
+        return TemplateEngine.PATTERN.sub(replace, template)
+
+
+class AutomationEngine:
+    def __init__(self):
+        self.hosts: dict[str, Host] = {}
+        self.handlers: dict[str, Handler] = {}
+        self.tasks: list[Task] = []
+        self.results: list[TaskResult] = []
+        self.pending_handlers: dict[str, set[str]] = {}
+        self.variables: dict[str, dict[str, Any]] = {}
+
+    def add_host(self, host: Host, variables: dict[str, Any]) -> None:
+        if host.name in self.hosts:
+            raise AutomationError(f"Duplicate host: {host.name}")
+
+        self.hosts[host.name] = host
+        self.variables[host.name] = variables
+
+    def add_handler(self, handler: Handler) -> None:
+        if handler.name in self.handlers:
+            raise AutomationError(
+                f"Duplicate handler: {handler.name}"
+            )
+
+        self.handlers[handler.name] = handler
+
+    def add_task(self, task: Task) -> None:
+        self.tasks.append(task)
+
+    def _record(
+        self,
+        host: Host,
+        task_name: str,
+        status: TaskStatus,
+        message: str,
+    ) -> None:
+        self.results.append(
+            TaskResult(task_name, host.name, status, message)
+        )
+
+    def _notify(self, host: Host, notification: str) -> None:
+        matching = [
+            handler
+            for handler in self.handlers.values()
+            if handler.name == notification
+            or notification in handler.listen
+        ]
+
+        if not matching:
+            raise TaskError(
+                f"Unknown handler notification: {notification}"
+            )
+
+        for handler in matching:
+            self.pending_handlers.setdefault(
+                host.name, set()
+            ).add(handler.name)
+
+    def execute_task(self, task: Task, host: Host) -> None:
+        if host.failed:
+            return
+
+        variables = self.variables[host.name]
+
+        try:
+            if task.condition is not None:
+                if not task.condition(host, variables):
+                    self._record(
+                        host,
+                        task.name,
+                        TaskStatus.SKIPPED,
+                        "Condition evaluated to false",
+                    )
+                    return
+
+            changed = task.action(host, variables)
+
+            status = (
+                TaskStatus.CHANGED if changed
+                else TaskStatus.OK
+            )
+
+            self._record(
+                host,
+                task.name,
+                status,
+                "Task completed successfully",
+            )
+
+            if changed:
+                for notification in task.notify:
+                    self._notify(host, notification)
+
+        except Exception as exc:
+            host.failed = True
+
+            self._record(
+                host,
+                task.name,
+                TaskStatus.FAILED,
+                str(exc),
+            )
+
+    def flush_handlers(self, host: Host) -> None:
+        """
+        Execute each notified handler once per host.
+
+        Notifications are deduplicated, matching Ansible's normal
+        handler behavior.
+        """
+
+        notifications = self.pending_handlers.pop(
+            host.name, set()
+        )
+
+        for handler_name in self.handlers:
+            if handler_name not in notifications:
+                continue
+
+            handler = self.handlers[handler_name]
+
+            try:
+                changed = handler.action(
+                    host, self.variables[host.name]
+                )
+
+                self._record(
+                    host,
+                    f"Handler: {handler.name}",
+                    TaskStatus.CHANGED if changed else TaskStatus.OK,
+                    "Handler executed",
+                )
+
+            except Exception as exc:
+                host.failed = True
+
+                self._record(
+                    host,
+                    f"Handler: {handler.name}",
+                    TaskStatus.FAILED,
+                    str(exc),
+                )
+
+                break
+
+    def run(self) -> list[TaskResult]:
+        for task in self.tasks:
+            for host in self.hosts.values():
+                self.execute_task(task, host)
+
+            # Handlers normally run after the task section or at
+            # an explicit flush_handlers point.
+            for host in self.hosts.values():
+                self.flush_handlers(host)
+
+        return self.results
+
+    def report(self) -> dict[str, Any]:
+        report: dict[str, Any] = {}
+
+        for host_name in self.hosts:
+            host_results = [
+                result for result in self.results
+                if result.host_name == host_name
+            ]
+
+            counts = {
+                status.value: sum(
+                    result.status == status
+                    for result in host_results
+                )
+                for status in TaskStatus
+            }
+
+            report[host_name] = {
+                "failed": self.hosts[host_name].failed,
+                "statistics": counts,
+                "results": [
+                    {
+                        "task": result.task_name,
+                        "status": result.status.value,
+                        "message": result.message,
+                    }
+                    for result in host_results
+                ],
+            }
+
+        return report
+
+
+def make_directory(host: Host, variables: dict[str, Any]) -> bool:
+    directory = variables["application_directory"]
+
+    if not isinstance(directory, str) or not directory.startswith("/"):
+        raise TaskError("Application directory must be an absolute path")
+
+    directories = host.state.setdefault("directories", set())
+
+    if directory in directories:
+        return False
+
+    directories.add(directory)
+    return True
+
+
+def deploy_configuration(
+    host: Host,
+    variables: dict[str, Any],
+) -> bool:
+    template = (
+        "server {\n"
+        "    listen {{ application_port }};\n"
+        "    server_name {{ application_name }};\n"
+        "    environment {{ environment }};\n"
+        "}\n"
+    )
+
+    rendered = TemplateEngine.render(template, variables)
+
+    configurations = host.state.setdefault("files", {})
+
+    destination = (
+        variables["application_directory"] + "/application.conf"
+    )
+
+    if configurations.get(destination) == rendered:
+        return False
+
+    configurations[destination] = rendered
+    return True
+
+
+def update_application(
+    host: Host,
+    variables: dict[str, Any],
+) -> bool:
+    version = variables["application_version"]
+
+    if not isinstance(version, str) or not version.strip():
+        raise TaskError("Application version must be non-empty")
+
+    if host.state.get("application_version") == version:
+        return False
+
+    host.state["application_version"] = version
+    return True
+
+
+def restart_service(
+    host: Host,
+    variables: dict[str, Any],
+) -> bool:
+    service = variables["service_name"]
+
+    host.state.setdefault("services", {})[service] = "running"
+    host.state["last_restart"] = service
+
+    return True
+
+
+def verify_application(
+    host: Host,
+    variables: dict[str, Any],
+) -> bool:
+    if host.state.get("application_version") is None:
+        raise TaskError("Application has not been deployed")
+
+    if host.state.get("services", {}).get(
+        variables["service_name"]
+    ) != "running":
+        raise TaskError("Application service is not running")
+
+    return False
+
+
+def build_engine() -> AutomationEngine:
+    engine = AutomationEngine()
+
+    base_variables = {
+        "defaults": {
+            "application_name": "inventory-api",
+            "application_port": 8080,
+            "application_directory": "/opt/inventory",
+            "service_name": "inventory-api",
+            "environment": "development",
+            "application_version": "1.0.0",
+        },
+        "inventory": {},
+        "group_vars": {
+            "environment": "production",
+        },
+        "host_vars": {},
+        "play_vars": {},
+        "task_vars": {},
+        "extra_vars": {},
+    }
+
+    production_variables = VariableResolver(
+        base_variables
+    ).resolve()
+
+    VariableResolver.require(
+        production_variables,
+        (
+            "application_name",
+            "application_port",
+            "application_directory",
+            "service_name",
+            "application_version",
+        ),
+    )
+
+    if not isinstance(production_variables["application_port"], int):
+        raise VariableError("Application port must be an integer")
+
+    if not 1 <= production_variables["application_port"] <= 65535:
+        raise VariableError("Application port is outside valid range")
+
+    engine.add_host(
+        Host("web01.example.internal", {"web"}),
+        production_variables.copy(),
+    )
+
+    engine.add_host(
+        Host("web02.example.internal", {"web", "canary"}),
+        {
+            **production_variables,
+            "application_port": 8081,
+        },
+    )
+
+    engine.add_handler(
+        Handler(
+            name="restart application",
+            action=restart_service,
+            listen={"application configuration changed"},
+        )
+    )
+
+    engine.add_task(
+        Task(
+            name="Create application directory",
+            action=make_directory,
+        )
+    )
+
+    engine.add_task(
+        Task(
+            name="Deploy application package",
+            action=update_application,
+            notify=["application configuration changed"],
+        )
+    )
+
+    engine.add_task(
+        Task(
+            name="Render application configuration",
+            action=deploy_configuration,
+            notify=["restart application"],
+            condition=lambda host, variables: (
+                variables["environment"] == "production"
+            ),
+        )
+    )
+
+    engine.add_task(
+        Task(
+            name="Verify application service",
+            action=verify_application,
+            condition=lambda host, variables: (
+                "web" in host.groups
+            ),
+        )
+    )
+
+    return engine
+
+
+def main() -> int:
+    try:
+        engine = build_engine()
+        engine.run()
+
+        print(
+            json.dumps(
+                engine.report(),
+                indent=2,
+                default=str,
+            )
+        )
+
+        failed = any(
+            host.failed for host in engine.hosts.values()
+        )
+
+        return 1 if failed else 0
+
+    except AutomationError as exc:
+        print(f"Automation error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
